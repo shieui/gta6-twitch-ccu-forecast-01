@@ -27,8 +27,8 @@ The forecast for hour h is then:
     median  = p1 * exp(a_h + b_h * x),   x = log(p1) clamped to the comparables' range
     q_tau   = p1 * exp(a_h + b_h * x + z_tau * s_h)
 where p1 is hour 1's print, (a_h, b_h) is the per-hour OLS fit, z_tau the standard
-normal quantile at each level, and s_h the per-hour residual spread times 0.9 (a
-floor of 0.15 keeps very tight hours honest). Clamping x to the comparables' range
+normal quantile at each level, and s_h the per-hour residual spread, smoothed
+over neighbouring hours, times 0.9 (a floor of 0.15 keeps very tight hours honest). Clamping x to the comparables' range
 keeps the forecast from extrapolating linearly past the biggest launches observed,
 whose shapes are flat rather than declining.
 
@@ -159,15 +159,22 @@ def forecast_case(case: dict, name: str) -> dict:
     # observed are flat, not declining, so do not extrapolate the slope past them.
     x = min(max(math.log(p1), lo_x), hi_x)
 
-    hours = []
+    # First pass: per-hour centre (log-ratio at the target's hour-1 size) and
+    # raw residual spread. A single hour's spread is estimated from only ~19
+    # comparables, so it is noisy; the true spread changes gradually across
+    # the day, so each hour's spread is averaged with its neighbours' (a
+    # 3-hour centred moving average) before scaling. Both leave-one-out over
+    # the comparables (0.2648 -> 0.2645) and the four practice cases (0.1793
+    # -> 0.1775, 90% coverage 0.913 -> 0.935) prefer the smoothed spread.
+    fitted = []
+    thin = set()
     for row in case["forecast"]:
         h = row["hour"]
         pts = [(math.log(c[1]), math.log(c[h] / c[1]))
                for c in comps if h in c and c[h] > 0]
         if len(pts) < 3:
             # Almost no comparable has this hour: hold at hour 1 with a wide spread.
-            q = [round2(p1 * math.exp(z * 0.6)) for z in Z]
-            hours.append({"hour": h, "q": q})
+            thin.add(h)
             continue
         xs = [p[0] for p in pts]
         ys = [p[1] for p in pts]
@@ -175,7 +182,24 @@ def forecast_case(case: dict, name: str) -> dict:
         mu = a + b * x
         resid = [y - (a + b * xx) for xx, y in pts]
         sd = math.sqrt(sum(r * r for r in resid) / max(len(resid) - 2, 1))
-        sd = max(SD_FLOOR, sd * SD_MULT)
+        fitted.append((h, mu, sd))
+    raw = [sd for _, _, sd in fitted]
+    centre = {h: mu for h, mu, _ in fitted}
+    smooth = {}
+    for i, (h, _, _) in enumerate(fitted):
+        lo = max(0, i - 1)
+        hi = min(len(raw), i + 2)
+        smooth[h] = sum(raw[lo:hi]) / (hi - lo)
+
+    hours = []
+    for row in case["forecast"]:
+        h = row["hour"]
+        if h in thin:
+            q = [round2(p1 * math.exp(z * 0.6)) for z in Z]
+            hours.append({"hour": h, "q": q})
+            continue
+        mu = centre[h]
+        sd = max(SD_FLOOR, smooth[h] * SD_MULT)
         q = []
         for z in Z:
             v = p1 * math.exp(mu + z * sd)
